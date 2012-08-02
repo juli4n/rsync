@@ -9,7 +9,6 @@
 package core
 
 import "crypto/md5"
-import "container/list"
 
 const (
   BlockSize = 1024 * 64
@@ -84,15 +83,12 @@ func ApplyOps(content []byte, ops chan RSyncOp, fileSize int) []byte {
 // All the operations are sent through a channel of RSyncOp.
 func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RSyncOp) {
 
-  hashesMap := make(map[uint32]*list.List)
+  hashesMap := make(map[uint32][]BlockHash)
   defer close(opsChannel)
 
   for _, h := range(hashes) {
     key := h.weakHash
-    if hashesMap[key] == nil {
-     hashesMap[key] = &list.List{}
-    }
-    hashesMap[key].PushBack(h)
+    hashesMap[key] = append(hashesMap[key], h)
   }
 
   var offset, previousMatch int
@@ -135,9 +131,8 @@ func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RS
 }
 
 // Searchs a given strong hash among all strong hashes in this bucket.
-func searchStrongHash(l *list.List, hashValue []byte) (bool,*BlockHash) {
-  for e := l.Front(); e != nil; e = e.Next() {
-    blockHash := e.Value.(BlockHash)
+func searchStrongHash(l []BlockHash, hashValue []byte) (bool,*BlockHash) {
+  for _, blockHash := range l {
     if string(blockHash.strongHash) == string(hashValue) {
       return true, &blockHash
     }
