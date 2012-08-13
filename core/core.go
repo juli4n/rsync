@@ -3,9 +3,8 @@
 // Use of this source code is governed by a BSD-style license that can be found
 // in the LICENSE file.
 
-// A Golang implementation of the rsync algorithm
-// This package contains the algorithm for both client
-// and server side.
+// A Golang implementation of the rsync algorithm.
+// This package contains the algorithm for both client and server side.
 package core
 
 import "crypto/md5"
@@ -21,27 +20,27 @@ type BlockHash struct {
 	weakHash   uint32
 }
 
-// There are two kind of operations at the client side. BLOCK and DATA.
-// If a block is found on the server, a BLOCK operation is sent over the network along with the block index.
-// Data between two found blocks, is sent like a DATA operation. 
+// There are two kind of operations: BLOCK and DATA.
+// If a block match is found on the server, a BLOCK operation is sent over the channel along with the block index.
+// Modified data between two block matches is sent like a DATA operation. 
 const (
 	BLOCK = iota
 	DATA
 )
 
-// An operation to be sent across the network. It can be either a block of raw data or a block index.
+// An rsync operation (typically to be sent across the network). It can be either a block of raw data or a block index.
 type RSyncOp struct {
 	// Kind of operation: BLOCK | DATA.
 	opCode int
-	// The raw modificated (or misaligned) data. Iff opCode == DATA
+	// The raw modificated (or misaligned) data. Iff opCode == DATA, nil otherwise.
 	data []byte
-	// The index of found block. Iff opCode == BLOCK.
+	// The index of found block. Iff opCode == BLOCK. nil otherwise.
 	blockIndex int
 }
 
 // Returns weak and strong hashes for a given slice.
 func CalculateBlockHashes(content []byte) []BlockHash {
-	blockHashes := make([]BlockHash, getBlockNumber(content))
+	blockHashes := make([]BlockHash, getBlocksNumber(content))
 	for i := range blockHashes {
 		initialByte := i * BlockSize
 		endingByte := min((i+1)*BlockSize, len(content))
@@ -53,7 +52,7 @@ func CalculateBlockHashes(content []byte) []BlockHash {
 }
 
 // Returns the number of blocks for a given slice of content.
-func getBlockNumber(content []byte) int {
+func getBlocksNumber(content []byte) int {
 	blockNumber := (len(content) / BlockSize)
 	if len(content)%BlockSize != 0 {
 		blockNumber += 1
@@ -80,7 +79,7 @@ func ApplyOps(content []byte, ops chan RSyncOp, fileSize int) []byte {
 }
 
 // Computes all the operations needed to recreate content.
-// All the operations are sent through a channel of RSyncOp.
+// All these operations are sent through a channel of RSyncOp.
 func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RSyncOp) {
 
 	hashesMap := make(map[uint32][]BlockHash)
@@ -106,9 +105,7 @@ func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RS
 			bweak = (bweak - (uint32(endingByte-offset) * uint32(content[offset-1])) + aweak) % M
 			weak = aweak + (1 << 16 * bweak)
 		}
-		if hashesMap[weak] != nil {
-			//strong := strongHash(block)
-			l := hashesMap[weak]
+		if l := hashesMap[weak]; l != nil {
 			blockFound, blockHash := searchStrongHash(l, strongHash(block))
 			if blockFound {
 				if dirty {
@@ -130,7 +127,7 @@ func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RS
 	}
 }
 
-// Searchs a given strong hash among all strong hashes in this bucket.
+// Searches for a given strong hash among all strong hashes in this bucket.
 func searchStrongHash(l []BlockHash, hashValue []byte) (bool, *BlockHash) {
 	for _, blockHash := range l {
 		if string(blockHash.strongHash) == string(hashValue) {
@@ -157,7 +154,7 @@ func weakHash(v []byte) (uint32, uint32, uint32) {
 	return (a % M) + (1 << 16 * (b % M)), a % M, b % M
 }
 
-// Returns the smaller of a or b. 
+// Returns the smaller of a or b.
 func min(a, b int) int {
 	if a < b {
 		return a

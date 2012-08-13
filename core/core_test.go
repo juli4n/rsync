@@ -9,13 +9,18 @@ package core
 import "testing"
 import "io/ioutil"
 
+type filePair struct {
+	original string
+	modified string
+}
+
 func Test_SyncModifiedContent(t *testing.T) {
 
-	files := []string{"golang"}
+	files := []filePair{filePair{"golang-original.bmp", "golang-modified.bmp"}, filePair{"text-original.txt", "text-modified.txt"}}
 
-	for _, filePrefix := range files {
-		original, _ := ioutil.ReadFile("test-data/" + filePrefix + "-original.bmp")
-		modified, _ := ioutil.ReadFile("test-data/" + filePrefix + "-modified.bmp")
+	for _, filePair := range files {
+		original, _ := ioutil.ReadFile("test-data/" + filePair.original)
+		modified, _ := ioutil.ReadFile("test-data/" + filePair.modified)
 
 		hashes := CalculateBlockHashes(original)
 		opsChannel := make(chan RSyncOp)
@@ -24,7 +29,7 @@ func Test_SyncModifiedContent(t *testing.T) {
 		result := ApplyOps(original, opsChannel, len(modified))
 
 		if string(result) != string(modified) {
-			t.Error(filePrefix + " sync did not work as expected.")
+			t.Errorf("rsync did not work as expected for %v", filePair)
 		}
 	}
 }
