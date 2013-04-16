@@ -110,6 +110,7 @@ func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan RS
 			if blockFound {
 				if dirty {
 					opsChannel <- RSyncOp{opCode: DATA, data: content[previousMatch:offset]}
+					dirty = false
 				}
 				opsChannel <- RSyncOp{opCode: BLOCK, blockIndex: blockHash.index}
 				previousMatch = endingByte
