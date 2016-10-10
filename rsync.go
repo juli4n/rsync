@@ -5,7 +5,7 @@
 
 // A Golang implementation of the rsync algorithm.
 // This package contains the algorithm for both client and server side.
-package core
+package rsync
 
 import "crypto/md5"
 

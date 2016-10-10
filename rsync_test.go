@@ -4,7 +4,7 @@
 // in the LICENSE file.
 
 // Unit tests for core package
-package core
+package rsync
 
 import "testing"
 import "io/ioutil"
