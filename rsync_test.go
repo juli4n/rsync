@@ -6,8 +6,12 @@
 // Unit tests for core package
 package rsync
 
-import "testing"
-import "io/ioutil"
+import (
+	"bytes"
+	"io/ioutil"
+	"os"
+	"testing"
+)
 
 type filePair struct {
 	original string
@@ -15,20 +19,27 @@ type filePair struct {
 }
 
 func Test_SyncModifiedContent(t *testing.T) {
-
-	files := []filePair{filePair{"golang-original.bmp", "golang-modified.bmp"}, filePair{"text-original.txt", "text-modified.txt"}}
+	files := []filePair{
+		filePair{"golang-original.bmp", "golang-modified.bmp"},
+		filePair{"text-original.txt", "text-modified.txt"}}
 
 	for _, filePair := range files {
-		original, _ := ioutil.ReadFile("test-data/" + filePair.original)
+		original, _ := os.Open("test-data/" + filePair.original)
 		modified, _ := ioutil.ReadFile("test-data/" + filePair.modified)
 
-		hashes := CalculateBlockHashes(original)
-		opsChannel := make(chan RSyncOp)
+		hashes, _ := CalculateBlockHashes(original)
+
+		opsChannel := make(chan Operation)
 		go CalculateDifferences(modified, hashes, opsChannel)
 
-		result := ApplyOps(original, opsChannel, len(modified))
+		result, err := ApplyOps(original, opsChannel)
+		if err != nil {
+			t.Error(err)
+		}
 
-		if string(result) != string(modified) {
+		resultBytes, err := ioutil.ReadAll(result)
+
+		if bytes.Compare(resultBytes, modified) != 0 {
 			t.Errorf("rsync did not work as expected for %v", filePair)
 		}
 	}
