@@ -38,6 +38,9 @@ func Test_SyncModifiedContent(t *testing.T) {
 		}
 
 		resultBytes, err := ioutil.ReadAll(result)
+		if err != nil {
+			t.Error(err)
+		}
 
 		if bytes.Compare(resultBytes, modified) != 0 {
 			t.Errorf("rsync did not work as expected for %v", filePair)
