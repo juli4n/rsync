@@ -1,36 +1,51 @@
-// Copyright 2016 Julian Gutierrez Oschmann (github.com/juli4n).
-// All rights reserved.
-// Use of this source code is governed by a BSD-style license that can be found
-// in the LICENSE file.
+/*
+Copyright 2016 Julian Gutierrez Oschmann (github.com/juli4n).
+Copyright 2019 Dolf 'Freeaqingme' Schimmel.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // Package rsync contains an implementation of the rsync algorithm.
 package rsync
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"fmt"
+	"hash"
 	"io"
-	"io/ioutil"
 )
 
 const (
-	BlockSize = 1024 * 64
-	M         = 1 << 16
+	defaultBlockSize   = 1024 * 64
+	m                  = 1 << 16
+	defaultMaxDataSize = 2 << 20 // 2 MiB
 )
 
 // BlockHash holds both strong and weak hash of a block.
 type BlockHash struct {
-	index      int
-	strongHash []byte
-	weakHash   uint32
+	Index      uint32
+	StrongHash []byte
+	WeakHash   uint32
 }
 
 // There are two kind of operations: BLOCK and DATA.
 // If a block match is found on the server, a BLOCK operation is sent over the channel along with the block index.
 // Modified data between two block matches is sent like a DATA operation.
 const (
-	BLOCK = iota
+	INVALID = iota
+	BLOCK
 	DATA
 )
 
@@ -39,17 +54,31 @@ const (
 type Operation struct {
 	// Kind of operation: BLOCK | DATA.
 	OpCode int
-	// The raw modificated (or misaligned) data. Iff opCode == DATA, nil otherwise.
+	// The raw modified (or misaligned) data. If opCode == DATA, nil otherwise.
 	Data []byte
-	// The index of found block. Iff opCode == BLOCK. nil otherwise.
-	BlockIndex int
+	// The index of found block. If opCode == BLOCK. 0 otherwise.
+	BlockIndex uint32
+}
+
+type Rsync struct {
+	StrongHashAlgo func() hash.Hash
+	BlockSize      int64
+	MaxDataSize    int64
+}
+
+func New() *Rsync {
+	return &Rsync{
+		StrongHashAlgo: md5.New,
+		BlockSize:      defaultBlockSize,
+		MaxDataSize:    defaultMaxDataSize, // Must be larger than block size
+	}
 }
 
 // CalculateBlockHashes returns a list of block hashes for a given byte stream.
-func CalculateBlockHashes(content io.Reader) ([]BlockHash, error) {
-	b := make([]byte, BlockSize)
+func (rsync *Rsync) CalculateBlockHashes(content io.Reader) ([]BlockHash, error) {
+	b := make([]byte, rsync.BlockSize)
 	var blockHashes []BlockHash
-	i := 0
+	i := uint32(1)
 	for {
 		n, err := content.Read(b)
 		if err == io.EOF {
@@ -58,8 +87,8 @@ func CalculateBlockHashes(content io.Reader) ([]BlockHash, error) {
 			return nil, err
 		}
 		weak, _, _ := weakHash(b[0:n])
-		strong := strongHash(b[0:n])
-		blockHashes = append(blockHashes, BlockHash{index: i, strongHash: strong, weakHash: weak})
+		strong := rsync.strongHash(b[0:n])
+		blockHashes = append(blockHashes, BlockHash{Index: i, StrongHash: strong, WeakHash: weak})
 		i++
 	}
 	return blockHashes, nil
@@ -67,36 +96,28 @@ func CalculateBlockHashes(content io.Reader) ([]BlockHash, error) {
 
 // ApplyOps applies operations from a given channel to the original content
 // and returns a reader with the modified content.
-func ApplyOps(original io.Reader, ops chan Operation) (io.Reader, error) {
-	if s, ok := original.(io.ReadSeeker); ok {
-		return applyOpsSeeker(s, ops), nil
-	}
-	b, err := ioutil.ReadAll(original)
-	if err != nil {
-		return nil, err
-	}
-	return applyOpsSeeker(bytes.NewReader(b), ops), nil
-}
-
-func applyOpsSeeker(original io.ReadSeeker, ops chan Operation) io.Reader {
+func (rsync *Rsync) ApplyOps(original io.ReadSeeker, ops chan Operation) io.ReadCloser {
 	r, w := io.Pipe()
 	go func() {
 		for op := range ops {
 			switch op.OpCode {
 			case BLOCK:
+				offset := int64(op.BlockIndex-1) * rsync.BlockSize
 				// There is a block match, set the reader offset to the right position
 				// and do the copy. If something goes wrong, just close the writer with an error.
-				if _, err := original.Seek(int64(op.BlockIndex*BlockSize), io.SeekStart); err != nil {
+				if _, err := original.Seek(offset, io.SeekStart); err != nil {
 					w.CloseWithError(err)
 				}
-				if n, err := io.CopyN(w, original, BlockSize); err != nil {
+				if n, err := io.CopyN(w, original, rsync.BlockSize); err != nil {
 					w.CloseWithError(err)
-				} else if n != BlockSize {
-					w.CloseWithError(fmt.Errorf("Cannot read block at offset %d", op.BlockIndex*BlockSize))
+				} else if n != rsync.BlockSize {
+					w.CloseWithError(fmt.Errorf("Cannot read block at offset %d", offset))
 				}
 			case DATA:
 				// There is no block match. Copy the raw data.
 				w.Write(op.Data)
+			case INVALID:
+				panic("Invalid OP")
 			}
 		}
 		w.Close()
@@ -104,59 +125,116 @@ func applyOpsSeeker(original io.ReadSeeker, ops chan Operation) io.Reader {
 	return r
 }
 
-// CalculateDifferences computes all the operations needed to recreate content.
-// All these operations are sent through a channel of RSyncOp.
-func CalculateDifferences(content []byte, hashes []BlockHash, opsChannel chan Operation) {
+func (rsync *Rsync) BuildHashMap(hashes []BlockHash) map[uint32][]BlockHash {
 	hashesMap := make(map[uint32][]BlockHash)
-	defer close(opsChannel)
 
 	for _, h := range hashes {
-		key := h.weakHash
+		key := h.WeakHash
 		hashesMap[key] = append(hashesMap[key], h)
 	}
 
-	var offset, previousMatch int
+	return hashesMap
+}
+
+// CalculateDifferences computes all the operations needed to recreate content.
+// All these operations are sent through a channel of RSyncOp.
+func (rsync *Rsync) CalculateDifferences(ctx context.Context,
+	source io.Reader,
+	hashesMap map[uint32][]BlockHash,
+	opsChannel chan Operation,
+) {
+
+	defer close(opsChannel)
+	content, err := newSlidingWindowBuf(source, rsync.MaxDataSize)
+	if err != nil {
+		// now what?
+	}
+
+	var offset, previousMatch, size, endingByte int64
 	var aweak, bweak, weak uint32
 	var dirty, isRolling bool
+	var prevLastByte, lastByte byte
+	var block []byte
 
-	for offset < len(content) {
-		endingByte := min(offset+BlockSize, len(content)-1)
-		block := content[offset:endingByte]
+	dirtyContent := make([]byte, rsync.MaxDataSize)
+
+	for true {
+		block, size, _ = content.ReadAt(offset, rsync.BlockSize)
+		endingByte = offset + size
+		if len(block) == 0 {
+			break
+		}
+
 		if !isRolling {
 			weak, aweak, bweak = weakHash(block)
 			isRolling = true
 		} else {
-			aweak = (aweak - uint32(content[offset-1]) + uint32(content[endingByte-1])) % M
-			bweak = (bweak - (uint32(endingByte-offset) * uint32(content[offset-1])) + aweak) % M
+			prevLastByte, _ = content.ReadByteAt(offset - 1)
+			lastByte, _ = content.ReadByteAt(endingByte - 1)
+
+			aweak = (aweak - uint32(prevLastByte) + uint32(lastByte)) % m
+			bweak = (bweak - (uint32(endingByte-offset) * uint32(prevLastByte)) + aweak) % m
 			weak = aweak + (1 << 16 * bweak)
 		}
+
 		if l := hashesMap[weak]; l != nil {
-			blockFound, blockHash := searchStrongHash(l, strongHash(block))
+			blockFound, blockHash := rsync.searchStrongHash(l, rsync.strongHash(block))
 			if blockFound {
 				if dirty {
-					opsChannel <- Operation{OpCode: DATA, Data: content[previousMatch:offset]}
+					dirtyContent, _, _ = content.ReadAt(previousMatch, offset-previousMatch)
+
+					select {
+					case opsChannel <- Operation{OpCode: DATA, Data: dirtyContent}:
+					case <-ctx.Done():
+						return
+					}
 					dirty = false
 				}
-				opsChannel <- Operation{OpCode: BLOCK, BlockIndex: blockHash.index}
+				select {
+				case opsChannel <- Operation{OpCode: BLOCK, BlockIndex: blockHash.Index}:
+				case <-ctx.Done():
+					return
+				}
+
 				previousMatch = endingByte
 				isRolling = false
-				offset += BlockSize
+				offset += rsync.BlockSize
 				continue
 			}
 		}
+
+		if (offset - previousMatch) >= rsync.MaxDataSize {
+			dirtyContent, _, _ = content.ReadAt(previousMatch, rsync.MaxDataSize)
+
+			select {
+			case opsChannel <- Operation{OpCode: DATA, Data: dirtyContent}:
+			case <-ctx.Done():
+				return
+			}
+			previousMatch = offset
+			isRolling = false
+		}
+
 		dirty = true
 		offset++
 	}
 
 	if dirty {
-		opsChannel <- Operation{OpCode: DATA, Data: content[previousMatch:]}
+		dirtyContent, _, _ = content.ReadAt(previousMatch, offset-previousMatch)
+
+		select {
+		case opsChannel <- Operation{OpCode: DATA, Data: dirtyContent}:
+		case <-ctx.Done():
+			return
+		}
 	}
+
 }
 
 // Searches for a given strong hash among all strong hashes in this bucket.
-func searchStrongHash(l []BlockHash, hashValue []byte) (bool, *BlockHash) {
+func (rsync *Rsync) searchStrongHash(l []BlockHash, hashValue []byte) (bool, *BlockHash) {
 	for _, blockHash := range l {
-		if bytes.Compare(blockHash.strongHash, hashValue) == 0 {
+		if bytes.Compare(blockHash.StrongHash, hashValue) == 0 {
 			return true, &blockHash
 		}
 	}
@@ -164,8 +242,8 @@ func searchStrongHash(l []BlockHash, hashValue []byte) (bool, *BlockHash) {
 }
 
 // Returns a strong hash for a given block of data
-func strongHash(v []byte) []byte {
-	h := md5.New()
+func (rsync *Rsync) strongHash(v []byte) []byte {
+	h := rsync.StrongHashAlgo()
 	h.Write(v)
 	return h.Sum(nil)
 }
@@ -177,13 +255,5 @@ func weakHash(v []byte) (uint32, uint32, uint32) {
 		a += uint32(v[i])
 		b += (uint32(len(v)-1) - uint32(i) + 1) * uint32(v[i])
 	}
-	return (a % M) + (1 << 16 * (b % M)), a % M, b % M
-}
-
-// Returns the smaller of a or b.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return (a % m) + (1 << 16 * (b % m)), a % m, b % m
 }
